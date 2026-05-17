@@ -75,7 +75,7 @@ agent-side wire-compatibility for older fleets.
 ## Quick start
 
 ```bash
-git clone https://github.com/yourorg/argus.git
+git clone git@github.com:johnalvero/argus.git
 cd argus
 npm install
 cp .env.example .env       # edit JWT_SECRET (generate with the command in the file)
