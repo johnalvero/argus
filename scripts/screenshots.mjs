@@ -45,6 +45,81 @@ async function login(page, { email, password }) {
   }
 }
 
+// Replacements applied to every screenshot's DOM text before capture.
+// Order matters — longer/more-specific patterns first so they're not
+// pre-shortened by an earlier rule.
+const TEXT_REDACTIONS = [
+  ["admin@convergeict.com", "admin@example.com"],
+  ["johnhomer@gmail.com", "admin@example.com"],
+  ["edge-noc-01.convergeict.com", "web-01.example.com"],
+  ["edge-noc-01", "web-01"],
+  ["CICTRELMAC002.local", "desktop-02.example.com"],
+  ["CICTRELMAC002", "desktop-02"],
+  ["convergeict.com", "example.com"],
+  // Private IPs visible in dev fleet — swap for RFC 5737 documentation
+  // range so the screenshots are unambiguously fake.
+  [/\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "192.0.2.10"],
+  [/\b172\.(1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}\b/g, "192.0.2.20"],
+];
+
+async function redactTextNodes(page) {
+  await page.evaluate((rawReplacements) => {
+    // Reconstruct regexes that crossed the bridge as serialized objects.
+    const replacements = rawReplacements.map(([needle, repl]) => {
+      if (typeof needle === "object" && needle.__regex) {
+        return [new RegExp(needle.source, needle.flags), repl];
+      }
+      return [needle, repl];
+    });
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT
+    );
+    const updates = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      let txt = n.nodeValue ?? "";
+      let changed = false;
+      for (const [needle, repl] of replacements) {
+        if (needle instanceof RegExp) {
+          const next = txt.replace(needle, repl);
+          if (next !== txt) {
+            txt = next;
+            changed = true;
+          }
+        } else if (txt.includes(needle)) {
+          txt = txt.split(needle).join(repl);
+          changed = true;
+        }
+      }
+      if (changed) updates.push([n, txt]);
+    }
+    for (const [n, t] of updates) n.nodeValue = t;
+    // Also redact input values (token placeholder, etc).
+    for (const el of document.querySelectorAll("input, textarea")) {
+      let v = el.value ?? "";
+      let changed = false;
+      for (const [needle, repl] of replacements) {
+        if (needle instanceof RegExp) {
+          const next = v.replace(needle, repl);
+          if (next !== v) {
+            v = next;
+            changed = true;
+          }
+        } else if (v.includes(needle)) {
+          v = v.split(needle).join(repl);
+          changed = true;
+        }
+      }
+      if (changed) el.value = v;
+    }
+  }, TEXT_REDACTIONS.map(([n, r]) =>
+    n instanceof RegExp
+      ? [{ __regex: true, source: n.source, flags: n.flags }, r]
+      : [n, r]
+  ));
+}
+
 async function shot(page, urlPath, file, opts = {}) {
   const target = `${BASE_URL}${urlPath}`;
   await page.goto(target);
@@ -52,6 +127,7 @@ async function shot(page, urlPath, file, opts = {}) {
   // Give SWR a beat to populate.
   await page.waitForTimeout(800);
   if (opts.beforeShot) await opts.beforeShot(page);
+  await redactTextNodes(page);
   const out = path.join(SCREENSHOTS_DIR, file);
   await page.screenshot({ path: out, fullPage: opts.fullPage ?? false });
   console.log(`  → ${file}`);
