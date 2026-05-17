@@ -1,0 +1,471 @@
+// Prisma schema for Argus.
+//
+// SQLite is the v1 store. Single-process Next server reads/writes via
+// Prisma. Reports are stored as opaque JSON strings so the wire format
+// from `software-inventory.sh` can evolve without a migration.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── UI users ─────────────────────────────────────────────────────────
+// Local-only auth in v1. No SSO. Admins bootstrap each other.
+model User {
+  id                 Int      @id @default(autoincrement())
+  email              String   @unique
+  passwordHash       String
+  isAdmin            Boolean  @default(false)
+  // Admin-set initial password; user must rotate on next login. The
+  // server-side `getSession` gate refuses every endpoint except the
+  // password-change flow while this is true — defence-in-depth so a
+  // curl client can't bypass the UI gate.
+  mustChangePassword Boolean  @default(true)
+  // Bumped on password change / admin reset. JWTs carrying a stale
+  // version are rejected, so a reset instantly invalidates every other
+  // device's session.
+  tokenVersion       Int      @default(0)
+  // User-selected IANA timezone (e.g. "Asia/Manila"). Null means "use
+  // the browser's detected zone" — the client falls back to
+  // Intl.DateTimeFormat().resolvedOptions().timeZone when this is null.
+  timezone           String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  tokensCreated      IngestToken[] @relation("CreatedBy")
+  auditEvents        AuditEvent[]
+  syncRuns           CveSyncRun[]
+  watchlists         Watchlist[]
+  notificationReads  NotificationRead[]
+}
+
+// ─── Fleet hosts ──────────────────────────────────────────────────────
+model Host {
+  id                Int      @id @default(autoincrement())
+  // Stable host id sourced from the agent (machine-id / dbus-id / MAC
+  // fallback). Indexed + unique. Matches `host_id` in the JSON payload.
+  hostId            String   @unique
+  hostname          String
+  osId              String
+  osName            String
+  osVersion         String
+  osVersionCodename String?
+  kernel            String?
+  arch              String?
+  packageManager    String?
+  agentVersion      String?
+  // Primary private/VPC-internal address — the first global-scope IPv4
+  // the agent reported. Shown in the host list + searchable. Multi-NIC
+  // hosts keep the full {iface,addr} array in `ipAddresses` below.
+  privateIp         String?
+  // JSON-stringified array mirroring the payload's `ip_addresses`.
+  // Kept as TEXT so we don't need an N:M HostIp table in v1.
+  ipAddresses       String?
+  firstSeenAt       DateTime @default(now())
+  lastReportAt      DateTime
+  // sha256 of the most recent payload body. Used for cheap "did
+  // anything change?" deduping on ingest — equal hash → 202 unchanged.
+  lastReportHash    String?
+  reports           Report[]
+  packages          HostPackage[]
+  tags              HostTag[]
+  vulnerabilities   HostVulnerability[]
+
+  @@index([lastReportAt])
+}
+
+// ─── Raw report archive ───────────────────────────────────────────────
+model Report {
+  id          Int      @id @default(autoincrement())
+  hostId      Int
+  host        Host     @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  // Full original JSON payload as text. Don't trust callers to send the
+  // identical shape forever; keep the opaque blob for forensics.
+  payload     String
+  // sha256 hex of `payload` exactly as received.
+  hash        String
+  // From the agent: when the snapshot was actually taken on the host.
+  collectedAt DateTime
+  // When we wrote it. Differs from `collectedAt` for buffered/replayed
+  // reports.
+  receivedAt  DateTime @default(now())
+
+  @@index([hostId, receivedAt])
+}
+
+// ─── Denormalised package index (latest report per host) ──────────────
+// One row per (host, name, version, arch) of the LATEST report only.
+// On each ingest we wipe + re-populate for that host so "who runs
+// openssl 1.1.1k?" is a single indexed scan.
+model HostPackage {
+  id      Int    @id @default(autoincrement())
+  hostId  Int
+  host    Host   @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  // Discriminator: "os" for native packages (dpkg/rpm/apk/pacman) and
+  // an ecosystem name ("pip","npm","gem","composer","cargo",…) for
+  // language-level packages. Default "os" backfills legacy rows.
+  ecosystem String  @default("os")
+  // Free-form provenance hint for language packages — "system" for
+  // globally-installed, future: "user:alice", "project:/path/to/app".
+  // Always empty for ecosystem="os".
+  location  String?
+  name    String
+  version String
+  arch    String
+
+  @@unique([hostId, ecosystem, name, version, arch])
+  @@index([ecosystem, name])
+  @@index([name])
+  @@index([name, version])
+}
+
+// ─── Collector config (server-driven agent toggles) ──────────────────
+// Singleton row (always name="default"). Read by both the agent — via
+// the bearer-authed GET /api/v1/config — and the admin UI. Defaults
+// match the agent's compiled-in behavior so the initial migration is a
+// true no-op for the existing fleet.
+//
+// New tier-1 features (kernel mitigations, loaded modules, pending
+// updates, container runtime, virtualization, uptime, snap/flatpak)
+// default OFF. They land here so the UI can expose them today; the
+// agent-side helpers ship in a later round, at which point the
+// operator opts in centrally and every host picks it up on the next
+// cron tick.
+model CollectorConfig {
+  id                       Int      @id @default(autoincrement())
+  name                     String   @unique
+  // Today's effective defaults — DO NOT change without bumping version
+  // and considering fleet-wide payload impact.
+  collectOsPackages        Boolean  @default(true)
+  collectLanguagePackages  Boolean  @default(true)
+  collectIpAddresses       Boolean  @default(true)
+  collectServices          Boolean  @default(true)
+  collectListeners         Boolean  @default(true)
+  collectContainers        Boolean  @default(true)
+  // Opt-in features — no agent-side helper yet.
+  collectKernelMitigations Boolean  @default(false)
+  collectLoadedModules     Boolean  @default(false)
+  collectPendingUpdates    Boolean  @default(false)
+  collectContainerRuntime  Boolean  @default(false)
+  collectVirtualization    Boolean  @default(false)
+  collectUptime            Boolean  @default(false)
+  collectSnapPackages      Boolean  @default(false)
+  collectFlatpakPackages   Boolean  @default(false)
+  // ─── UI display thresholds ─────────────────────────────────────────
+  // Mission creep, acknowledged: these are NOT agent toggles. They are
+  // operator-facing UI knobs for the host list's staleness dot (green
+  // until amber-days, then amber until red-days, then red). They live
+  // here only to avoid spinning up a second `SystemConfig` model for
+  // two integer fields. If a third unrelated display knob lands, split
+  // these out into their own model.
+  //
+  // Read by everyone with a session (not just admins) via
+  // GET /api/display-prefs. Written by admins via the existing
+  // /api/admin/collector-config endpoint, which bumps `version` on
+  // change just like the bool fields do.
+  staleHostAmberDays       Int      @default(1)
+  staleHostRedDays         Int      @default(3)
+  // ─── Data retention ────────────────────────────────────────────────
+  // Reports older than `reportRetentionDays` are deleted on every
+  // cleanup sweep (fleet-wide, single query). 30 matches the legacy
+  // hardcoded per-host prune that lived in /api/v1/reports.
+  reportRetentionDays      Int      @default(30)
+  // When set, hosts whose `lastReportAt` is older than this are
+  // deleted entirely — Reports + HostPackages cascade via FK. Null
+  // (the default) disables host expiry so today's behavior is
+  // preserved. Operator opts in once they're sure they don't need to
+  // revive missing hosts.
+  inactiveHostRetentionDays Int?
+  // When the last full cleanup sweep finished. Used by the ingest path
+  // to throttle the fire-and-forget auto-cleanup to once / 24h.
+  lastCleanupAt            DateTime?
+  // Monotonic. Bumped on every PUT that mutates a field. The agent uses
+  // it to short-circuit re-applying the plan when nothing has changed.
+  version                  Int      @default(1)
+  updatedAt                DateTime @updatedAt
+}
+
+// ─── Branding (singleton) ─────────────────────────────────────────────
+// Admin-configurable company name + logo for the sidebar header and
+// other surfaces. Singleton row keyed by name="default", same pattern
+// as CollectorConfig. Logo bytes are stored inline as BLOB so v1 stays
+// self-contained — no separate object store or filesystem dependency.
+model Branding {
+  id           Int      @id @default(autoincrement())
+  name         String   @unique
+  companyName  String   @default("Converge ICT")
+  // Raw logo bytes. Null = no custom logo set; UI falls back to the
+  // default Package icon. Validated server-side to MIME type whitelist
+  // (PNG/JPEG/WEBP) and size cap (500 KB) before insert.
+  logoData     Bytes?
+  logoMimeType String?
+  updatedAt    DateTime @updatedAt
+}
+
+// ─── Host tags ────────────────────────────────────────────────────────
+// First-class taxonomy for slicing the fleet — "prod", "dmz", "pci",
+// "team-payments", etc. Tag taxonomy is JH's to define; we ship zero
+// seed rows on purpose. Downstream features (CVE dashboard, watchlists,
+// compliance scorecard) all filter through this table.
+//
+// Name is unique, slug-ish (1–32 chars, [a-z0-9][a-z0-9-]*). Color is
+// a hex string validated server-side; the UI ships a curated 12-swatch
+// palette but custom hex is allowed.
+model Tag {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique
+  color       String
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  hosts       HostTag[]
+}
+
+// Join table. Replace-semantics on the host-tags PUT endpoint — we
+// wipe and re-insert per host on save, so no soft-delete or status
+// column is needed. Cascades both ways: deleting a Tag or a Host
+// removes the association.
+model HostTag {
+  hostId    Int
+  tagId     Int
+  host      Host     @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([hostId, tagId])
+  @@index([tagId])
+}
+
+// ─── Audit log ────────────────────────────────────────────────────────
+// Append-only ledger of admin mutations — Phase A round 2 foundation for
+// the security/ops push. Every admin POST/PUT/PATCH/DELETE drops a row
+// here AFTER the mutation succeeds (fire-and-forget; logging failures
+// never break the actual action). Reads are admin-only, cursor-paginated
+// by `id` desc.
+//
+// Denormalised `actorEmail` is intentional: when a user is deleted the
+// relation goes null (SetNull) but the email snapshot is preserved so
+// historic context survives. Same pattern as IngestToken's `prefix`.
+model AuditEvent {
+  id          Int      @id @default(autoincrement())
+  actorId     Int?
+  actor       User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  // Snapshot of the actor's email at the time of the action. Survives
+  // user deletion, which nulls `actorId`.
+  actorEmail  String
+  // Free string for forward compat — today's vocabulary is
+  // "create" | "update" | "delete" | "trigger" | "upload".
+  action      String
+  // "tag" | "host_tag" | "branding" | "collector_config" | "user" |
+  // "ingest_token" | etc. Free string for the same reason.
+  entityType  String
+  // Stringified — sometimes the entity is a singleton ("default").
+  entityId    String?
+  // One-line human description, e.g. "renamed tag 'prod' to 'production'"
+  summary     String
+  // Optional JSON-stringified {before, after} for richer drill-in.
+  diff        String?
+  // X-Forwarded-For first hop, x-real-ip, or null.
+  ip          String?
+  // First 200 chars of the request UA.
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@index([entityType, entityId])
+}
+
+// ─── Ingest tokens ────────────────────────────────────────────────────
+// Bearer tokens used by `software-inventory.sh` agents. NOT JWTs —
+// random 32-byte values prefixed with `argus_` (legacy tokens minted
+// before the rename use `sbom_`; verification accepts both). Only a
+// bcrypt hash is stored; the raw token is shown exactly once at
+// creation time.
+model IngestToken {
+  id          Int       @id @default(autoincrement())
+  name        String    // human label, e.g. "fleet-prod"
+  tokenHash   String    @unique
+  // First 8 chars of the raw token (e.g. "argus_a1") kept verbatim for
+  // display + fast lookup at ingest time. Prefix alone is not enough to
+  // authenticate — bcrypt.compare still runs against tokenHash.
+  prefix      String
+  createdAt   DateTime  @default(now())
+  createdById Int
+  createdBy   User      @relation("CreatedBy", fields: [createdById], references: [id])
+  lastUsedAt  DateTime?
+  enabled     Boolean   @default(true)
+
+  @@index([prefix])
+}
+
+// ─── CVE / vulnerability cache ────────────────────────────────────────
+// One row per distinct OSV id we've ever seen. Detail (summary, CVSS,
+// references) is fetched from osv.dev exactly once per modification —
+// subsequent sync runs short-circuit if the upstream `modified`
+// timestamp hasn't advanced beyond `modifiedAt`. Aliases + references
+// are JSON-stringified for the same forward-compat reason `Report`
+// keeps its payload as text.
+model Vulnerability {
+  id          Int      @id @default(autoincrement())
+  // "CVE-2024-XXXXX" / "GHSA-..." / "DSA-..." / "USN-..." — whatever
+  // OSV uses as the primary id for the record.
+  osvId       String   @unique
+  summary     String
+  details     String?
+  // Bucketed severity derived from the highest CVSS v3 base score, or
+  // "UNKNOWN" when OSV doesn't carry a CVSS_V3 entry.
+  severity    String?
+  cvssScore   Float?
+  // JSON-stringified `string[]` of alias ids (other CVE / GHSA / DSA ids
+  // for the same underlying flaw).
+  aliases     String?
+  // JSON-stringified `Array<{type, url}>` mirroring OSV's references.
+  references  String?
+  publishedAt DateTime?
+  modifiedAt  DateTime?
+  fetchedAt   DateTime @default(now())
+  hostVulns   HostVulnerability[]
+
+  @@index([severity])
+  @@index([cvssScore])
+  @@index([modifiedAt])
+}
+
+// Join: which hosts are affected, via which package + version. Rebuilt
+// on every sync run — rows whose triple (host, package, version) no
+// longer matches a known vuln are deleted; rows that still match have
+// `lastSeenAt` bumped while `firstSeenAt` is preserved so the UI can
+// surface "first appeared 3 days ago".
+model HostVulnerability {
+  id              Int      @id @default(autoincrement())
+  hostId          Int
+  host            Host     @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  vulnerabilityId Int
+  vulnerability   Vulnerability @relation(fields: [vulnerabilityId], references: [id], onDelete: Cascade)
+  packageName     String
+  packageVersion  String
+  // Mirrors HostPackage.ecosystem so the UI can group "os" vs language
+  // vulns without a join back to HostPackage.
+  ecosystem       String
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+
+  @@unique([hostId, vulnerabilityId, packageName, packageVersion])
+  @@index([hostId])
+  @@index([vulnerabilityId])
+}
+
+// ─── Watchlists & notifications ───────────────────────────────────────
+// A Watchlist is a saved rule (vulnerability / package / host_drift).
+// On triggering events (CVE sync end, host report end, manual button),
+// `evaluateWatchlists` resolves matches per kind+spec and inserts
+// Notification rows keyed by a stable `dedupeKey` so re-evaluation is
+// idempotent. New notifications optionally fan out to email via SES.
+model Watchlist {
+  id              Int      @id @default(autoincrement())
+  name            String   @unique
+  description     String?
+  enabled         Boolean  @default(true)
+  // "vulnerability" | "package" | "host_drift" — keep as TEXT so the
+  // spec union can grow without a migration.
+  kind            String
+  // JSON-stringified rule spec, kind-specific. See `WatchlistSpec` in
+  // src/lib/types.ts for the discriminated union.
+  spec            String
+  // JSON-stringified `("inapp" | "email")[]`. "inapp" is always implied
+  // (we always write a Notification row); "email" gates SES delivery.
+  channels        String
+  // JSON-stringified `string[]` of recipient emails. Null = fall back
+  // to the creator's email.
+  recipients      String?
+  createdById     Int
+  createdBy       User     @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  lastEvaluatedAt DateTime?
+  matchCount      Int      @default(0)
+  notifications   Notification[]
+}
+
+model Notification {
+  id            Int      @id @default(autoincrement())
+  watchlistId   Int
+  watchlist     Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  title         String
+  body          String
+  href          String?
+  // "info" | "warning" | "critical"
+  severity      String
+  // Stable hash so re-evaluation of the same match is a UNIQUE conflict.
+  dedupeKey     String
+  // Null = not emailed yet (channel disabled OR failed). Sticky error
+  // string from the last SES attempt.
+  emailedAt     DateTime?
+  emailError    String?
+  readBy        NotificationRead[]
+  createdAt     DateTime @default(now())
+
+  @@unique([watchlistId, dedupeKey])
+  @@index([createdAt])
+}
+
+// Per-user read receipts. We don't bake `isRead` into Notification
+// because notifications are global per watchlist — each viewer carries
+// their own read state.
+model NotificationRead {
+  id             Int      @id @default(autoincrement())
+  notificationId Int
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         Int
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readAt         DateTime @default(now())
+
+  @@unique([notificationId, userId])
+  @@index([userId])
+}
+
+// SES email transport config. Singleton row keyed by name="default" —
+// same pattern as CollectorConfig + Branding. The secret access key is
+// AES-256-GCM encrypted with a key derived from JWT_SECRET; never
+// returned in GET responses.
+model SesConfig {
+  id                    Int      @id @default(autoincrement())
+  name                  String   @unique
+  enabled               Boolean  @default(false)
+  region                String?
+  accessKeyId           String?
+  // AES-256-GCM ciphertext (base64). Decrypt via decryptSecret() in
+  // src/lib/sesSecret.ts using JWT_SECRET-derived key + this IV.
+  secretAccessKeyCipher String?
+  secretAccessKeyIv     String?
+  fromAddress           String?
+  replyTo               String?
+  lastTestAt            DateTime?
+  lastTestOk            Boolean?
+  lastTestError         String?
+  updatedAt             DateTime @updatedAt
+}
+
+// Audit/observability row for each sync run. Inserted in "running" state
+// up front so the UI can poll for progress, then patched to success/
+// failed when the worker finishes. `triggeredById` is null for future
+// scheduled runs.
+model CveSyncRun {
+  id              Int      @id @default(autoincrement())
+  startedAt       DateTime @default(now())
+  finishedAt      DateTime?
+  status          String   // "running" | "success" | "failed"
+  packagesQueried Int      @default(0)
+  vulnsDiscovered Int      @default(0)
+  hostsAffected   Int      @default(0)
+  newVulns        Int      @default(0)
+  error           String?
+  triggeredById   Int?
+  triggeredBy     User?    @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+
+  @@index([startedAt])
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=SBOM Collector — Next.js fleet inventory
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/sbom-collector
+EnvironmentFile=/opt/sbom-collector/.env
+Environment=NODE_ENV=production
+Environment=PORT=3005
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=3
+# Soft cap so a runaway leak doesn't take the host with it.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
