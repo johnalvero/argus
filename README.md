@@ -12,6 +12,27 @@ alerts via email, audit logging, and more.
 Built for security and ops teams who want SBOM tooling without paying
 per-host SaaS fees or running a Java agent on every box.
 
+![Argus dashboard](docs/screenshots/dashboard.png)
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td><a href="docs/screenshots/hosts-list.png"><img src="docs/screenshots/hosts-list.png" alt="Hosts list" /></a><br/><sub>Hosts list — tag filters, severity dots, per-host vuln counts</sub></td>
+    <td><a href="docs/screenshots/vulnerabilities-list.png"><img src="docs/screenshots/vulnerabilities-list.png" alt="Vulnerabilities" /></a><br/><sub>Vulnerabilities — severity strip, ecosystem &amp; tag filters, OSV data</sub></td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/host-detail.png"><img src="docs/screenshots/host-detail.png" alt="Host detail" /></a><br/><sub>Host detail — packages, services, listeners, containers, vulnerabilities, reports</sub></td>
+    <td><a href="docs/screenshots/compliance-scorecard.png"><img src="docs/screenshots/compliance-scorecard.png" alt="Compliance scorecard" /></a><br/><sub>Compliance scorecard — composite grade across four health dimensions</sub></td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/install-agent.png"><img src="docs/screenshots/install-agent.png" alt="Install agent" /></a><br/><sub>Install agent — copy-paste SSH / cloud-init / manual snippets</sub></td>
+    <td><a href="docs/screenshots/collector-config.png"><img src="docs/screenshots/collector-config.png" alt="Collector config" /></a><br/><sub>Collector config — server-driven agent feature toggles</sub></td>
+  </tr>
+</table>
+
 ---
 
 ## Highlights
